@@ -14,13 +14,18 @@ G:\AZ\stt\
     FireRedVAD\           语音端点检测 (自动去静音)
     FireRedPunc\          标点恢复
   voice_typing.py          主程序
+  fireredasr2s\            识别库源码(已内置, 含内存直传补丁)
+  requirements.txt         Python 依赖清单(版本已锁定)
+  安装环境.bat             一键安装: venv + PyTorch(CUDA) + 依赖 + 模型下载
+  dl.py                    模型下载脚本(ModelScope, 约 5GB)
   hotword.py              热词模块(解码偏置 + 拼写校正)
-  hotwords.txt            自定义热词表(一行一个, # 开头是注释)
+  hotwords.example.txt    热词表模板(复制为 hotwords.txt 后使用)
+  hotwords.txt            自定义热词表(个人文件, 不进 git)
   postprocess.py          输出后处理(数字/口语/标点规则改写)
   replacements.txt        自定义替换表(原词 => 新词, 默认全注释)
   pick_key.py             按键拾取器(设置热键用)
   make_fp16.py            把主模型 fp32 权重转 fp16(省 2.2GB 磁盘, 加载更快)
-  config.json             用户配置(热键/设备/热词偏置强度等)
+  config.json             用户配置(热键/设备/热词偏置强度等; 不进 git)
   启动语音输入.bat         前台启动(有控制台, 能看到识别结果)
   启动语音输入(后台).vbs   后台静默启动(双击即可, 无窗口)
   停止语音输入.bat         停止后台进程
@@ -32,14 +37,48 @@ G:\AZ\stt\
   logs\voice_typing.log    运行日志
 ```
 
+## 从零安装（新电脑）
+
+要求：Windows + NVIDIA 显卡（推理在 GPU 上跑）+ Python 3.10~3.12（64 位）+ 联网。
+
+**方式一（推荐）：一键安装**
+
+```
+git clone https://github.com/wztshine/voice-typing.git
+cd voice-typing
+双击「安装环境.bat」
+```
+
+它会自动完成：创建 venv → 装 PyTorch CUDA 版 → 装其余依赖（版本锁定在 requirements.txt）→
+从 ModelScope 下载三个模型（约 5GB，支持断点续传）→ 转 fp16 权重 → 生成热词表。
+
+**方式二：手动**
+
+```bat
+git clone https://github.com/wztshine/voice-typing.git
+cd voice-typing
+python -m venv venv
+venv\Scripts\python -m pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu126
+venv\Scripts\pip install -r requirements.txt
+venv\Scripts\python dl.py          :: 下载模型, 约 5GB
+venv\Scripts\python make_fp16.py   :: 可选, fp16 权重省一半显存
+copy hotwords.example.txt hotwords.txt
+启动语音输入.bat
+```
+
+> 注意 PyTorch 必须用 `--index-url https://download.pytorch.org/whl/cu126` 装 CUDA 版，
+> 直接 `pip install torch` 装的是 CPU 版，跑不了（或慢几十倍）。
+> 识别库 `fireredasr2s` 已内置在仓库 `fireredasr2s/` 目录，无需单独安装。
+> 首次启动加载模型约 20 秒，之后常驻显存秒响应。
+
 ## 使用
 
 - 按住 **右侧 Ctrl** 说话、松开输入（热键可改，见下文）
 - **F10**（按一下开始录音、再按一下结束，适合长段口述）
 - 首次启动需加载模型，约 3~5 秒，之后常驻显存
 - 识别结果通过「剪贴板 + Ctrl+V」输入，原剪贴板内容会自动还原；识别文本带隐私标记，不会进入 Win+V 剪贴板历史，也不会同步云剪贴板
-  （连续两次识别也会还原到最早的内容；原内容是**图片/文件**时无法备份，
-  会被识别文字替换，日志会提示一句）
+  （连续两次识别也会还原到最早的内容；原内容是**图片/文件/富文本**也会完整还原，
+  只有剪贴板被长期锁死导致快照失败时才会退化成只还原纯文本，日志会有记录）
 - 每次说话长度建议 1~30 秒；说完整句，识别效果最好
 - 说话时屏幕底部会弹出浮窗：绿点 + 计时 + 音量条表示**正在录音**，黄点「识别中…」，蓝点「✓ 已输入」并显示文字，约 2 秒后自动消失
 

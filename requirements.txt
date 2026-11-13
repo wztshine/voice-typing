@@ -1,0 +1,23 @@
+# 语音打字 (voice-typing) 依赖
+# 注意: torch 需要装 CUDA 版(见 README), 不要直接 pip install torch
+# 本文件用当前实测可用的版本锁定; 安装命令见 README「从零安装」
+
+torch==2.11.0
+torchaudio==2.11.0
+numpy==2.5.4
+sounddevice==0.5.6
+soundfile==0.14.0
+pynput==1.8.2
+pyperclip==1.11.0
+pypinyin==0.55.0
+modelscope==1.40.2
+transformers==5.22.2
+
+# fireredasr2s (识别库) 已内置在仓库 fireredasr2s/ 目录, 无需安装;
+# 以下是它的依赖
+cn2an==0.5.24
+kaldi_native_fbank==1.23.0
+kaldiio==2.18.1
+peft==0.21.2
+sentencepiece==0.2.3
+TextGrid==1.6.1
