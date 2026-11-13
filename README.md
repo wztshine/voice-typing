@@ -60,7 +60,7 @@ cd voice-typing
 python -m venv venv
 venv\Scripts\python -m pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu126
 venv\Scripts\pip install -r requirements.txt
-venv\Scripts\python dl.py          :: 下载模型, 约 5GB
+venv\Scripts\python dl.py          :: 下载模型, 约 6GB
 venv\Scripts\python make_fp16.py   :: 可选, fp16 权重省一半显存
 copy hotwords.example.txt hotwords.txt
 启动语音输入.bat
@@ -70,6 +70,45 @@ copy hotwords.example.txt hotwords.txt
 > 直接 `pip install torch` 装的是 CPU 版，跑不了（或慢几十倍）。
 > 识别库 `fireredasr2s` 已内置在仓库 `fireredasr2s/` 目录，无需单独安装。
 > 首次启动加载模型约 20 秒，之后常驻显存秒响应。
+
+## 显卡兼容性
+
+真正的门槛不是 FP16（它几乎人人支持），而是这三条：
+
+1. **必须是 NVIDIA 卡**：PyTorch 在 Windows 上对 A 卡（ROCm）/ I 卡（IPEX）支持不成熟，基本等于 N 卡专属
+2. **显存 ≥ 4GB**：fp16 模型占 2.2GB + CUDA 上下文 + 激活值
+3. **Windows + Python 3.10~3.12**
+
+各代 N 卡对 FP16 的支持：
+
+| 世代 | 年份 | FP16 计算 |
+|---|---|---|
+| GTX 700/900 (Kepler/Maxwell) | 2012-14 | ❌ 模拟成 fp32 算，无加速；直接用 fp32 |
+| GTX 10 系 (Pascal) | 2016 | ⚠️ **能算但只有 1/64 吞吐，比 fp32 慢几十倍，见下方陷阱** |
+| RTX 20 系 (Turing) | 2018 | ✅ 全速 + Tensor Core（本项目实测卡：RTX 2060） |
+| RTX 30 系 (Ampere) | 2020 | ✅ 全速，还支持原生 bf16 |
+| RTX 40/50 系 (Ada/Blackwell) | 2022+ | ✅ 全速 + FP8/FP4 |
+
+程序会自动选精度：支持原生 bf16 的卡（30 系+）用 bf16，不支持的（20 系及更老）自动落到 fp16，
+无需手动配置。
+
+### Pascal（GTX 10 系）陷阱
+
+Pascal 消费卡的 FP16 计算吞吐只有 fp32 的 **1/64**——`use_half: true` 会合法地跑在比 fp32
+慢几十倍的速度上，而且不报任何错。老卡（GTX 10 系及更早）的正确配置：
+
+```json
+"use_half": false,
+"fast_load": false
+```
+
+另外 fp32 权重要 4.4GB 显存，GTX 10 系多数只有 6~8GB，比较勉强；显存不够就换更新的卡。
+
+### 关于 FP8/INT8 量化
+
+FP8 张量核心需要 RTX 40 系（SM 8.9+）或 Hopper；20/30 系只能“存 FP8、算时解包回 FP16”，
+不提速还降精度。INT8/INT4 量化（GPTQ/AWQ）需要专门推理引擎适配本模型，工程量大。结论：
+**20/30 系上 fp16 就是精度与速度的最优解，继续往下压纯属负优化**。
 
 ## 使用
 
