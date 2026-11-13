@@ -1,15 +1,15 @@
-# 运行环境与大文件
-venv/
-models/
-__pycache__/
+# 运行环境与大文件 (锚定根目录, 别误杀 fireredasr2s/fireredasr2/models/)
+/venv/
+/models/
+/__pycache__/
 *.pyc
 
 # 运行产物
-logs/
+/logs/
 
 # 个人配置(每台机器自己留一份, 不进公开仓库)
-config.json
-hotwords.txt
+/config.json
+/hotwords.txt
 
 # IDE
 .vscode/
