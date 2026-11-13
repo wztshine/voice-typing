@@ -1,0 +1,16 @@
+# 运行环境与大文件
+venv/
+models/
+__pycache__/
+*.pyc
+
+# 运行产物
+logs/
+
+# 个人配置(每台机器自己留一份, 不进公开仓库)
+config.json
+hotwords.txt
+
+# IDE
+.vscode/
+.idea/
