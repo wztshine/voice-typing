@@ -39,7 +39,7 @@ G:\AZ\stt\
 
 ## 从零安装（新电脑）
 
-要求：Windows + NVIDIA 显卡（推理在 GPU 上跑）+ Python 3.10~3.12（64 位）+ 联网。
+要求：Windows + NVIDIA 显卡（推理在 GPU 上跑，驱动建议更新到 2024 年之后）+ Python 3.10~3.12（64 位）+ 联网。
 
 **方式一（推荐）：一键安装**
 
@@ -50,7 +50,7 @@ cd voice-typing
 ```
 
 它会自动完成：创建 venv → 装 PyTorch CUDA 版 → 装其余依赖（版本锁定在 requirements.txt）→
-从 ModelScope 下载三个模型（约 5GB，支持断点续传）→ 转 fp16 权重 → 生成热词表。
+从 ModelScope 下载三个模型（约 6GB，支持断点续传）→ 转 fp16 权重 → 生成热词表。
 
 **方式二：手动**
 

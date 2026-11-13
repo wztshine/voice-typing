@@ -1,7 +1,8 @@
-import sys, os
+import os
 from modelscope import snapshot_download
 
-ROOT = r"G:\AZ\stt\models"
+# 模型下载到仓库根目录的 models/, 跟着脚本走, 换电脑/换路径都能用
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 jobs = [
     ("xukaituo/FireRedASR2-AED", "FireRedASR2-AED"),
     ("xukaituo/FireRedVAD", "FireRedVAD"),
