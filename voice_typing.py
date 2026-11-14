@@ -36,7 +36,7 @@ LOG = os.path.join(BASE, "logs", "voice_typing.log")
 CONFIG = os.path.join(BASE, "config.json")
 
 CFG = dict(
-    hotkey="f7",                   # 按住说话 (改为 f9 / scroll_lock / right_ctrl ...)
+    hotkey="ctrl_r",               # 按住说话 (改为 f9 / scroll_lock / right_ctrl ...)
     toggle_key="f10",              # 按一下开始, 再按一下结束(适合长段口述); "none" 关闭
     sample_rate=16000,
     min_sec=0.35,
@@ -48,7 +48,7 @@ CFG = dict(
     paste=True,           # True: 剪贴板粘贴(快, 中文最稳); False: 逐字模拟输入
     restore_clipboard=True,
     beep=True,
-    mute_speaker=False,   # 录音期间静音扬声器(防幻听: 音乐/视频/提示音被麦克风收进去识别成字), 结束即恢复
+    mute_speaker=True,    # 录音期间静音扬声器(防幻听: 音乐/视频/提示音被麦克风收进去识别成字), 结束即恢复
     hotword_bonus=2.0,    # 热词偏置强度(0 关闭). 4~6 更强势但可能误插
     vad_min_silence_ms=600,    # 停顿超过多久才认为一句结束(默认 0.6s)
     vad_merge_silence_ms=1400, # 两段语音间隔小于多久就合并成一段(默认 1.4s)
