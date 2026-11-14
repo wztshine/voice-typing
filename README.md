@@ -82,7 +82,7 @@ make_fp16.py           fp32→fp16 权重转换
 安装环境.bat           一键装环境 + 模型
 启动/停止/重启.bat      日常操作
 设置热键.bat           可视化选说话键
-hotwords.txt           热词表(个人文件, 模板: hotwords.example.txt)
+hotwords.txt           热词表(随仓库分发, 当前为空样例; 原始模板: hotwords.example.txt)
 replacements.txt       自定义替换表
-config.json            用户配置(个人文件)
+config.json            用户配置(随仓库分发, 与代码默认值一致)
 ```

@@ -4,12 +4,8 @@
 /__pycache__/
 *.pyc
 
-# 运行产物
+# 运行产物 (含语音识别记录和录音, 不进公开仓库)
 /logs/
-
-# 个人配置(每台机器自己留一份, 不进公开仓库)
-/config.json
-/hotwords.txt
 
 # IDE
 .vscode/

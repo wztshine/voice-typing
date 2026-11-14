@@ -1,0 +1,22 @@
+﻿{
+    "hotkey":  "ctrl_r",
+    "toggle_key":  "f10",
+    "hotword_bonus":  2.0,
+    "vad_min_silence_ms":  600,
+    "vad_merge_silence_ms":  1400,
+    "join_gap_ms":  2500,
+    "beam_size":  3,
+    "postprocess":  true,
+    "filler_removal":  true,
+    "number_norm":  true,
+    "uppercase_abbr":  [
+                           "po"
+                       ],
+    "show_ui":  true,
+    "live_preview":  false,
+    "live_after_sec":  3.0,
+    "live_interval_ms":  1200,
+    "live_max_sec":  10.0,
+    "diagnose":  false,
+    "mute_speaker":  true
+}
