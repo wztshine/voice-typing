@@ -10,6 +10,8 @@ soundfile==0.14.0
 pynput==1.8.2
 pyperclip==1.11.0
 pypinyin==0.55.0
+pycaw==20260927      # mute_speaker: 录音期间静音扬声器
+comtypes==1.5.0      # pycaw 依赖
 modelscope==1.40.2
 transformers==5.22.2
 

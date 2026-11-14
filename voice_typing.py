@@ -4,6 +4,7 @@
 按住热键说话 -> 松开 -> 识别结果自动输入到当前光标处
 """
 import argparse
+import atexit
 import ctypes
 import logging
 import os
@@ -47,6 +48,7 @@ CFG = dict(
     paste=True,           # True: 剪贴板粘贴(快, 中文最稳); False: 逐字模拟输入
     restore_clipboard=True,
     beep=True,
+    mute_speaker=False,   # 录音期间静音扬声器(防幻听: 音乐/视频/提示音被麦克风收进去识别成字), 结束即恢复
     hotword_bonus=2.0,    # 热词偏置强度(0 关闭). 4~6 更强势但可能误插
     vad_min_silence_ms=600,    # 停顿超过多久才认为一句结束(默认 0.6s)
     vad_merge_silence_ms=1400, # 两段语音间隔小于多久就合并成一段(默认 1.4s)
@@ -143,7 +145,7 @@ def load_config():
     # 布尔项写成 "false"/0 时也能按字面意思理解
     for k in ("use_half", "enable_vad", "enable_punc", "paste", "restore_clipboard",
               "beep", "show_ui", "live_preview", "postprocess", "filler_removal",
-              "number_norm", "diagnose", "fast_load"):
+              "number_norm", "diagnose", "fast_load", "mute_speaker"):
         if k in data and not isinstance(data[k], bool):
             v = data[k]
             if isinstance(v, str):
@@ -294,7 +296,7 @@ def clipboard_snapshot():
 
 def clipboard_restore(items):
     """把快照原样写回剪贴板(先 EmptyClipboard 再逐格式 SetClipboardData)。
-    返回 False = 剪贴板没打开/中途失败, 调用方可做兑底"""
+    返回 False = 剪贴板没打开/中途失败, 调用方可做兜底"""
     if items is None:
         return True
     try:
@@ -518,6 +520,75 @@ def _patch_aed_fast_load():
     return "fp16+mmap (%.1f GB)" % (os.path.getsize(p) / 1024 ** 3)
 
 
+class SpeakerMute:
+    """录音期间静音默认扬声器, 结束后恢复 (config: mute_speaker)
+
+    防幻听: 电脑正在放的音乐/视频/提示音会被麦克风收进去, 识别成幽灵文字。
+    pycaw 未安装或非 Windows 时自动降级为空操作; 任何失败都只记日志, 不影响录音。
+    每次都在当前线程重新拿 COM 接口 (start 在热键线程, stop 可能在看门狗线程,
+    COM 接口不跨线程复用); 只记得"进入前是否已静音", 不替用户取消他自己设的静音。
+    限制: 只管系统默认播放设备; 进程被强杀(taskkill /F)时来不及恢复, 需手动取消静音。
+    """
+
+    def __init__(self, enabled):
+        self.enabled = bool(enabled)
+        self.active = False       # 当前是否处于"由本程序静音"的状态
+        self._was_muted = False   # 进入前的原状态
+        self._warned = False      # pycaw 缺失只提醒一次
+
+    def _endpoint(self):
+        """在当前线程初始化 COM 并拿默认播放设备的音量接口, 拿不到返回 None"""
+        if os.name != "nt":
+            return None
+        try:
+            import comtypes
+            try:                  # 工作线程可能还没初始化 COM; 已初始化时调用无害
+                comtypes.CoInitialize()
+            except OSError:
+                pass
+            from pycaw.pycaw import AudioUtilities
+            return AudioUtilities.GetSpeakers().EndpointVolume
+        except Exception:
+            return None
+
+    def start(self):
+        """录音开始: 记住原状态并静音. 任何失败都只降级, 绝不抛异常"""
+        if not self.enabled or self.active:
+            return
+        vol = self._endpoint()
+        if vol is None:
+            if not self._warned:
+                self._warned = True
+                log("mute_speaker 需要 pycaw: pip install pycaw comtypes (仅提示一次)")
+            return
+        try:
+            self._was_muted = bool(vol.GetMute())
+            if not self._was_muted:
+                vol.SetMute(1, None)
+                self.active = True
+                log("录音期间已静音扬声器(防幻听), 结束后恢复")
+            # 进入前本来就是静音的就不动它, 结束时也无需恢复
+        except Exception:
+            log("扬声器静音失败(不影响录音):\n" + traceback.format_exc())
+
+    def stop(self):
+        """录音结束: 恢复进入前的状态. 重复调用/未静音时是空操作"""
+        if not self.active:
+            return
+        self.active = False
+        if self._was_muted:
+            return                # 进入前本来就是静音的, 不替用户取消静音
+        try:
+            vol = self._endpoint()
+            if vol is None:
+                log("扬声器恢复失败(拿不到音频设备), 可能需要手动取消静音")
+                return
+            vol.SetMute(0, None)
+            log("扬声器已恢复")
+        except Exception:
+            log("扬声器恢复失败, 可能需要手动取消静音:\n" + traceback.format_exc())
+
+
 class Overlay:
     """屏幕底部浮窗: 录音状态 / 实时草稿 / 最终结果"""
 
@@ -537,6 +608,7 @@ class Overlay:
         self.level_max = 0.0
         self.hide_at = 0.0
         self.hwnd = None
+        self.mute = None         # SpeakerMute 对象(由 VoiceInput.run 注入); 非空且 active 时标题显示"静音外放"
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -678,7 +750,8 @@ class Overlay:
         now = time.time()
         if self.state in ("rec", "draft"):
             t = now - self.t_rec
-            self.cv.itemconfigure(self.title, text="● 录音中  %.1fs" % t)
+            badge = " · 静音外放" if self.mute is not None and self.mute.active else ""
+            self.cv.itemconfigure(self.title, text="● 录音中  %.1fs%s" % (t, badge))
             self.level_max = max(self.level_max, self.level)
             frac = min(1.0, (self.level / 4000.0) ** 0.5)
             self.cv.coords(self.bar, 16, 86, 16 + frac * (self.W - 32), 90)
@@ -731,6 +804,8 @@ class VoiceInput:
         self.system = None
         self.down = set()
         self.ui = None
+        self.mute = SpeakerMute(cfg.get("mute_speaker"))
+        atexit.register(self.mute.stop)    # 退出(含 Ctrl+C)时兜底恢复扬声器
         self.model_lock = threading.Lock()
         # 剪贴板还原状态: 连续两次识别时, 后一次不能把前一次识别出的文字当成"原剪贴板"
         self._clip_lock = threading.Lock()
@@ -841,6 +916,7 @@ class VoiceInput:
                     pass
 
             stream = None
+            self.mute.start()            # 先静音扬声器: 提示音/音乐不进麦克风
             try:
                 stream = sd.InputStream(samplerate=sr, channels=1, dtype="int16",
                                         device=self.cfg["device"], callback=cb)
@@ -851,6 +927,7 @@ class VoiceInput:
                         stream.close()
                     except Exception:
                         pass
+                self.mute.stop()         # 开流失败也要把扬声器恢复回来
                 raise
             self.stream = stream
             self.recording = True
@@ -933,6 +1010,7 @@ class VoiceInput:
                         stream.close()    # stop 报错也不能跳过 close, 否则设备被占用
                     except Exception:
                         pass
+            self.mute.stop()              # 恢复扬声器(后面"说话太短"等提前 return 前也要恢复)
         if self.cfg["beep"]:
             threading.Thread(target=_beep, args=(780, 60), daemon=True).start()
         if dur < self.cfg["min_sec"] or not chunks:
@@ -1037,7 +1115,7 @@ class VoiceInput:
                 self._clip_gen += 1
                 gen = self._clip_gen
             if not clipboard_copy_excluded(text):
-                pyperclip.copy(text)   # 兑底: 标记写不进去也要保证能粘贴
+                pyperclip.copy(text)   # 兜底: 标记写不进去也要保证能粘贴
             seq = clipboard_sequence()
             time.sleep(0.06)
             with self.kb.pressed(keyboard.Key.ctrl):
@@ -1115,6 +1193,7 @@ class VoiceInput:
                 prev_fg = user32.GetForegroundWindow()
                 root = tk.Tk()
                 self.ui = Overlay(root)
+                self.ui.mute = self.mute if self.mute.enabled else None
                 log("浮窗已启用(屏幕底部); 关闭浮窗可在 config.json 设 \"show_ui\": false")
                 # 双保险: 如果建窗口时不小心抢了前台, 立刻还给原窗口
                 cur = user32.GetForegroundWindow()
@@ -1131,10 +1210,13 @@ class VoiceInput:
         log(f"就绪: 按住 [{self.cfg.get('hotkey')}] 说话, 松开即输入; "
             f"[{self.cfg.get('toggle_key')}] 按一下开始/再按结束. Ctrl+C 退出")
 
-        if root is not None:
-            root.mainloop()      # Tk 必须占主线程, 键盘监听在后台线程
-        else:
-            listener.join()
+        try:
+            if root is not None:
+                root.mainloop()      # Tk 必须占主线程, 键盘监听在后台线程
+            else:
+                listener.join()
+        finally:
+            self.mute.stop()         # 无论怎么退出都把扬声器恢复回来
 
 
 def _beep(freq, ms):
