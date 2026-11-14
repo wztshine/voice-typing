@@ -916,7 +916,10 @@ class VoiceInput:
                     pass
 
             stream = None
-            self.mute.start()            # 先静音扬声器: 提示音/音乐不进麦克风
+            if self.cfg["beep"]:
+                _beep(1100, 60)      # 开麦前先响提示音: 此时未静音所以听得见, 响完才开麦也不会被录进去
+                time.sleep(0.03)     # 留点余量让尾音散掉
+            self.mute.start()            # 先静音扬声器: 提示音已响完, 音乐/视频声不进麦克风
             try:
                 stream = sd.InputStream(samplerate=sr, channels=1, dtype="int16",
                                         device=self.cfg["device"], callback=cb)
@@ -938,8 +941,7 @@ class VoiceInput:
         threading.Thread(target=self._watchdog, args=(self.sid,), daemon=True).start()
         if self.cfg.get("live_preview", False):
             threading.Thread(target=self._live_loop, args=(self.sid,), daemon=True).start()
-        if self.cfg["beep"]:
-            threading.Thread(target=_beep, args=(1100, 60), daemon=True).start()
+        # 开始提示音已提前到开麦前同步响(见 start_rec 前段); 结束提示音在 stop_rec 里
         log("● 录音中 ...")
 
     def _live_loop(self, sid):
