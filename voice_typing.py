@@ -299,6 +299,23 @@ def clipboard_snapshot():
         return None
 
 
+def _clip_free_gdi(g, items):
+    """释放快照里复制出来的 GDI 句柄(还原没把它们交给剪贴板时防泄漏;
+    成功 SetClipboardData 的句柄归系统所有, 不能调这个)"""
+    for fmt, data, is_gdi in items or []:
+        if not is_gdi or not data:
+            continue
+        try:
+            if fmt == 14:            # CF_ENHMETAFILE
+                g.DeleteEnhMetaFile.argtypes = [ctypes.c_void_p]
+                g.DeleteEnhMetaFile(data)
+            else:                     # CF_BITMAP / CF_PALETTE
+                g.DeleteObject.argtypes = [ctypes.c_void_p]
+                g.DeleteObject(data)
+        except Exception:
+            pass
+
+
 def clipboard_restore(items):
     """把快照原样写回剪贴板(先 EmptyClipboard 再逐格式 SetClipboardData)。
     返回 False = 剪贴板没打开/中途失败, 调用方可做兜底"""
@@ -307,13 +324,15 @@ def clipboard_restore(items):
     try:
         u, g, k = _clip_api()
         if not _clip_open(u):
+            _clip_free_gdi(g, items)   # 没放进去的 GDI 句柄自己释放, 防泄漏
             return False
         try:
             u.EmptyClipboard()
             _set_clip_privacy_markers(u, k)   # 还原不算“新复制”, 别再记进历史
             for fmt, data, is_gdi in items:
                 if is_gdi:        # data 是复制出来的 GDI 句柄, 交给系统接管
-                    u.SetClipboardData(fmt, data)
+                    if not u.SetClipboardData(fmt, data):
+                        _clip_free_gdi(g, [(fmt, data, True)])
                     continue
                 h = k.GlobalAlloc(GMEM_MOVEABLE, len(data))
                 if not h:
@@ -852,28 +871,31 @@ class Overlay:
 
     def _poll(self):
         try:
-            while True:
-                state, text, level = self.q.get_nowait()
-                if level is not None:
-                    self.level = level
-                self._apply(state, text)
-        except queue.Empty:
-            pass
+            try:
+                while True:
+                    state, text, level = self.q.get_nowait()
+                    if level is not None:
+                        self.level = level
+                    self._apply(state, text)
+            except queue.Empty:
+                pass
 
-        now = time.time()
-        if self.state in ("rec", "draft"):
-            t = now - self.t_rec
-            badge = " · 静音外放" if self.mute is not None and self.mute.active else ""
-            self.cv.itemconfigure(self.title, text="● 录音中  %.1fs%s" % (t, badge))
-            self.level_max = max(self.level_max, self.level)
-            frac = min(1.0, (self.level / 4000.0) ** 0.5)
-            self.cv.coords(self.bar, 16, 86, 16 + frac * (self.W - 32), 90)
-            if t > 1.2 and self.level_max < 25:
-                self.cv.itemconfigure(self.body, text="没检测到声音，检查麦克风", fill="#f0a020")
-        elif self.state in ("ok", "info") and now > self.hide_at:
-            self._hide()
-
-        self.root.after(80, self._poll)
+            now = time.time()
+            if self.state in ("rec", "draft"):
+                t = now - self.t_rec
+                badge = " · 静音外放" if self.mute is not None and self.mute.active else ""
+                self.cv.itemconfigure(self.title, text="● 录音中  %.1fs%s" % (t, badge))
+                self.level_max = max(self.level_max, self.level)
+                frac = min(1.0, (self.level / 4000.0) ** 0.5)
+                self.cv.coords(self.bar, 16, 86, 16 + frac * (self.W - 32), 90)
+                if t > 1.2 and self.level_max < 25:
+                    self.cv.itemconfigure(self.body, text="没检测到声音，检查麦克风", fill="#f0a020")
+            elif self.state in ("ok", "info") and now > self.hide_at:
+                self._hide()
+        except Exception:
+            pass          # 出错也不能断掉轮询链, 否则浮窗永久冻结在最后一帧
+        finally:
+            self.root.after(80, self._poll)   # 无论成败都要排下一轮
 
 
 def join_sentences(res, gap_ms=2500):
@@ -1199,9 +1221,12 @@ class VoiceInput:
                 if dur >= 2.0 and len(text) <= 3:
                     log(f"  ! 音频 {dur:.2f}s 却只识别出 {len(text)} 个字符, "
                         f"若反复出现请把 config.json 的 diagnose 设为 true 再复现一次")
-                self.inject(text)
+                ok = self.inject(text)
                 if self.ui is not None:
-                    self.ui.set_state("ok", text)
+                    if ok is False:
+                        self.ui.set_state("info", "输入失败(剪贴板被占用), 见日志")
+                    else:
+                        self.ui.set_state("ok", text)
             except Exception:
                 log("识别出错:\n" + traceback.format_exc())
                 if self.ui is not None:
@@ -1244,7 +1269,7 @@ class VoiceInput:
                         clipboard_restore(data)
                     except Exception:
                         pass
-                return
+                return False          # 一个字都没输进去, 让浮窗如实报错
             seq = clipboard_sequence()
             time.sleep(0.06)
             with self.kb.pressed(keyboard.Key.ctrl):
@@ -1281,21 +1306,25 @@ class VoiceInput:
                 threading.Thread(target=restore, daemon=True).start()
         else:
             _type_text(text)
+        return None                   # 正常路径(含 dry-run/逐字输入)
 
     # ---------- hotkey ----------
     def on_press(self, key):
         now = time.monotonic()
         last = self.down.get(key)
-        if last is not None and now - last < 0.5:
+        # 阈值 2.0s: Windows 自动重复的"重复延迟"默认 500ms、最长可设约 1s,
+        # 阈值必须明显大于它, 否则正常按住时第一个重复事件会被误判成"松键丢失"
+        # (曾用 0.5s, 每段录音都误报一次, 还会给切换键投出幻影 toggle 停掉录音)
+        if last is not None and now - last < 2.0:
             self.down[key] = now         # 正常按住: 系统自动重复(约33ms一发), 只刷新时间
             return
         if last is not None:
-            # 上次按下后 0.5s 内没有任何重复事件, 只能是 release 丢了(睡眠唤醒/驱动
+            # 上次按下后 2s 内没有任何重复事件, 只能是 release 丢了(睡眠唤醒/驱动
             # 吞事件, 实际发生过): 不复位的话这个键会被当成"一直按着", 之后的每次
             # 按下全被当自动重复忽略 -- 热键就此失灵到看门狗超时为止
             log("检测到按键 release 事件丢失, 自动复位")
         self.down[key] = now
-        # 只投递命令立即返回: start_rec 里的响铃+等待+COM 调用若在 pynput 监听线程
+        # 只投递命令立即返回: start_rec 里的静音/开麦/COM 调用若在 pynput 监听线程
         # 里同步执行, 会阻塞低级键盘钩子, 超时后钩子甚至被 Windows 静默摘除(热键失灵)
         try:
             if self.toggle_key is not None and key == self.toggle_key:
