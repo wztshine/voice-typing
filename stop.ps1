@@ -1,7 +1,8 @@
 $dir = $PSScriptRoot
-# 只匹配本目录下的 voice_typing.py, 误杀别的 checkout / 静态检查等无关 python 进程
+# 只匹配本目录的常驻实例: 排除 --file/--dry-run/--unmute 等一次性进程, 别打断它们干活
 $procs = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" |
-    Where-Object { $_.CommandLine -like "*$dir*voice_typing.py*" }
+    Where-Object { $_.CommandLine -like "*$dir*voice_typing.py*" -and
+                   $_.CommandLine -notmatch '--(file|dry-run|unmute)' }
 
 if (-not $procs) {
     Write-Host "语音输入当前未在运行。"

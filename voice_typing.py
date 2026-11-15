@@ -526,17 +526,32 @@ def _patch_aed_fast_load():
     return "fp16+mmap (%.1f GB)" % (os.path.getsize(p) / 1024 ** 3)
 
 
-def _pid_alive(pid):
-    """Windows 下判断进程是否还活着(所有权文件防误伤并发实例用)"""
+def _pid_is_ours(pid):
+    """pid 活着且是本程序的 python 进程才算"活实例": 纯 pid 复用会把孤儿静音
+    误判成活实例, 导致自愈永久失效"""
     try:
-        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-        # 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        k32.QueryFullProcessImageNameW.argtypes = (
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_ulong))
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        h = k32.OpenProcess(0x1000, False, int(pid))  # 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False      # 进程已死 -> 孤儿
+        try:
+            buf = ctypes.create_unicode_buffer(520)
+            n = ctypes.c_ulong(520)
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                name = (buf.value or "").replace("/", "\\").lower()
+                if not name.endswith(("python.exe", "pythonw.exe")):
+                    return False  # pid 被无关进程复用 -> 孤儿
+            return True       # 查不到映像名(极罕见): 保守当活实例, 不误伤并发实例
+        finally:
+            k32.CloseHandle(h)
     except Exception:
-        return False
-    if not h:
-        return False
-    ctypes.windll.kernel32.CloseHandle(h)
-    return True
+        return True           # 判断不了时保守当活实例, 不误解除并发实例的静音
 
 
 def _default_endpoint():
@@ -594,6 +609,12 @@ class SpeakerMute:
     def _heal_orphan(self):
         """发现所有权文件 = 上个进程死在静音中, 没来得及恢复: 补恢复"""
         try:
+            tmp = MUTE_OWNER + ".tmp"
+            if os.path.exists(tmp):
+                os.remove(tmp)    # 原子写中断留下的残留
+        except Exception:
+            pass
+        try:
             if not os.path.exists(MUTE_OWNER):
                 return
             try:
@@ -604,11 +625,12 @@ class SpeakerMute:
                 log("静音所有权文件损坏, 按上次异常退出遗留处理")
         except Exception:
             return
+        # 注: was_muted 恒为 False(所有权文件只在真正静音时写), 分支纯防御
+        if info.get("pid") and _pid_is_ours(info["pid"]):
+            return                # 活实例的所有权文件(如并发 --dry-run), 不是孤儿, 不动
         if info.get("was_muted"):
             self._clear_owner()   # 上个实例进入前本来就静音, 无需恢复
             return
-        if info.get("pid") and _pid_alive(info["pid"]):
-            return                # 活实例的所有权文件(如并发 --dry-run), 不是孤儿, 不动
         ep = self._endpoint()
         if ep is None:
             log("上次异常退出遗留了扬声器静音, 但暂拿不到音频设备; 可手动取消静音, "
@@ -1089,6 +1111,7 @@ class VoiceInput:
             if time.monotonic() - self.t_rec > self.cfg["max_sec"]:
                 log(f"录音超过 {self.cfg['max_sec']}s, 自动停止")
                 self.stop_rec()
+                self.down.clear()   # 兜底: 万一热键的 release 事件丢了, 别让 down 残留卡死热键
                 return
             time.sleep(0.5)
 
@@ -1221,8 +1244,22 @@ class VoiceInput:
                     self._clip_original = snap
                 self._clip_gen += 1
                 gen = self._clip_gen
-            if not clipboard_copy_excluded(text):
-                pyperclip.copy(text)   # 兜底: 标记写不进去也要保证能粘贴
+            try:
+                if not clipboard_copy_excluded(text):
+                    pyperclip.copy(text)   # 兜底: 标记写不进去也要保证能粘贴
+            except Exception:
+                # 写剪贴板彻底失败: 此刻剪贴板可能已被清空, 且 restore 线程还没建。
+                # 立即还原用户原内容, 不能等下一次识别(可能没有下一次)
+                log("写剪贴板失败, 立即还原原内容:\n" + traceback.format_exc())
+                with self._clip_lock:
+                    data, self._clip_original = self._clip_original, None
+                    self._clip_pending = False
+                if data:
+                    try:
+                        clipboard_restore(data)
+                    except Exception:
+                        pass
+                return
             seq = clipboard_sequence()
             time.sleep(0.06)
             with self.kb.pressed(keyboard.Key.ctrl):
@@ -1325,9 +1362,17 @@ class VoiceInput:
                     except Exception:
                         log("退出前恢复扬声器失败:\n" + traceback.format_exc())
                     t0 = time.monotonic()
-                    while self._clip_pending and time.monotonic() - t0 < 0.8:
-                        time.sleep(0.05)   # 等一眼还没跑完的剪贴板还原(它睡 0.5s 才动手),
-                    os._exit(0)            # 别把用户原剪贴板永久留在识别文本上
+                    while self._clip_pending and time.monotonic() - t0 < 2.0:
+                        time.sleep(0.05)   # 等还没跑完的剪贴板还原: 它先睡 0.5s, 大对象/
+                                           # 被占用重试还需时间, 预算太紧会把原剪贴板永久破坏
+                    try:
+                        # 若恰好停在 Ctrl+V 注入中途, 收尾抬起修饰键, 防 Ctrl 卡在系统层面
+                        for m in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r,
+                                  keyboard.Key.alt, keyboard.Key.shift, keyboard.Key.cmd):
+                            self.kb.release(m)
+                    except Exception:
+                        pass
+                    os._exit(0)            # 状态已恢复, 立即退出(不等 Tk/线程)
             except Exception:
                 pass
             time.sleep(0.15)
@@ -1417,7 +1462,7 @@ def _unmute_orphan():
             log("静音所有权文件损坏, 按上次异常退出遗留处理")
     except Exception:
         return 0
-    if info.get("pid") and _pid_alive(info["pid"]):
+    if info.get("pid") and _pid_is_ours(info["pid"]):
         return 0         # 活实例(并发 --dry-run 等), 不是孤儿, 不动
     if info.get("was_muted"):
         try:
@@ -1440,9 +1485,9 @@ def _unmute_orphan():
 
 def _single_instance():
     """同一时间只允许跑一个实例(开机自启+手动启动不会重复)"""
-    import ctypes
-    h = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\VoiceTyping")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)   # GetLastError 须经 use_last_error 才可靠
+    h = k32.CreateMutexW(None, False, "Local\\VoiceTyping")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         return None
     return h
 
@@ -1568,6 +1613,7 @@ def main():
         CFG["postprocess"] = False
     if a.dry_run:
         CFG["dry_run"] = True
+        CFG["mute_speaker"] = False   # 测试实例不参与扬声器静音/所有权文件, 免得和正式实例互踩
 
     if a.file:
         return transcribe_file(a.file)
