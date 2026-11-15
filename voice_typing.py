@@ -922,6 +922,8 @@ class VoiceInput:
                     pass
 
             stream = None
+            if not self.cfg["beep"]:
+                self.mute.start()    # 不响提示音: 维持旧序, 先静音再开麦, 背景声一点不进
             try:
                 stream = sd.InputStream(samplerate=sr, channels=1, dtype="int16",
                                         device=self.cfg["device"], callback=cb)
@@ -941,6 +943,8 @@ class VoiceInput:
             if self.ui is not None:
                 self.ui.set_state("rec")
             if self.cfg["beep"]:
+                if self.mute.active:         # 补上次没恢复成的静音: 先恢复, 提示音才听得见
+                    self.mute.stop()
                 # 提示音在开麦之后响(此时还没静音, 听得见): 麦克风从按下那刻就在录,
                 # 快速短句不会因为"等提示音"而丢掉开头.
                 # 关键: Beep() 返回只代表声音提交完毕, 它还要经过音频引擎/输出链路的
@@ -952,7 +956,7 @@ class VoiceInput:
                 _beep(1100, 60)
                 if self.mute.enabled:
                     time.sleep(guard - 0.06)       # Beep 已同步耗掉 60ms, 补等输出链路放完
-            self.mute.start()            # 提示音真正放完才静音: 音乐/视频声不进麦克风
+                self.mute.start()        # 提示音真正放完才静音: 音乐/视频声不进麦克风
         threading.Thread(target=self._watchdog, args=(self.sid,), daemon=True).start()
         if self.cfg.get("live_preview", False):
             threading.Thread(target=self._live_loop, args=(self.sid,), daemon=True).start()
