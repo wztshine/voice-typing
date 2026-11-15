@@ -553,8 +553,12 @@ class SpeakerMute:
 
     def start(self):
         """录音开始: 记住原状态并静音. 任何失败都只降级, 绝不抛异常"""
-        if not self.enabled or self.active:
+        if not self.enabled:
             return
+        if self.active:           # 上次恢复失败留下的"哑巴静音": 先补恢复, 否则提示音全被吞
+            self.stop()
+            if self.active:       # 还是没恢复成: 扬声器本来就是静的, 保持所有权下次再试
+                return
         vol = self._endpoint()
         if vol is None:
             if not self._warned:
@@ -575,18 +579,19 @@ class SpeakerMute:
         """录音结束: 恢复进入前的状态. 重复调用/未静音时是空操作"""
         if not self.active:
             return
-        self.active = False
         if self._was_muted:
+            self.active = False
             return                # 进入前本来就是静音的, 不替用户取消静音
         try:
             vol = self._endpoint()
             if vol is None:
-                log("扬声器恢复失败(拿不到音频设备), 可能需要手动取消静音")
-                return
+                log("扬声器恢复失败(拿不到音频设备), 下次开麦时自动补恢复")
+                return            # 保留 active=True, 下次 start 时补恢复
             vol.SetMute(0, None)
+            self.active = False   # 恢复成功才清除标记, 失败则下次开麦重试
             log("扬声器已恢复")
         except Exception:
-            log("扬声器恢复失败, 可能需要手动取消静音:\n" + traceback.format_exc())
+            log("扬声器恢复失败, 下次开麦时自动补恢复:\n" + traceback.format_exc())
 
 
 class Overlay:
@@ -799,6 +804,7 @@ class VoiceInput:
         self.stream = None
         self.chunks = []
         self.rec_lock = threading.Lock()   # 录音开始/结束互斥: 防止看门狗和热键同时停/开
+        self._beep_cut = 0            # 开录音头几帧要抹零的采样数(提示音+静音前漏进的背景声)
         self.q = queue.Queue()
         self.kb = keyboard.Controller()
         self.system = None
@@ -916,10 +922,6 @@ class VoiceInput:
                     pass
 
             stream = None
-            if self.cfg["beep"]:
-                _beep(1100, 60)      # 开麦前先响提示音: 此时未静音所以听得见, 响完才开麦也不会被录进去
-                time.sleep(0.03)     # 留点余量让尾音散掉
-            self.mute.start()            # 先静音扬声器: 提示音已响完, 音乐/视频声不进麦克风
             try:
                 stream = sd.InputStream(samplerate=sr, channels=1, dtype="int16",
                                         device=self.cfg["device"], callback=cb)
@@ -930,18 +932,31 @@ class VoiceInput:
                         stream.close()
                     except Exception:
                         pass
-                self.mute.stop()         # 开流失败也要把扬声器恢复回来
+                self.mute.stop()         # 兜底补恢复(此时一般还没静音, 空操作)
                 raise
             self.stream = stream
             self.recording = True
-            self.t_rec = time.time()
+            self.t_rec = time.time()     # 从开麦那刻计时: 等提示音的时间不吃录音时长
             self.sid = self.t_rec
-        if self.ui is not None:
-            self.ui.set_state("rec")
+            if self.ui is not None:
+                self.ui.set_state("rec")
+            if self.cfg["beep"]:
+                # 提示音在开麦之后响(此时还没静音, 听得见): 麦克风从按下那刻就在录,
+                # 快速短句不会因为"等提示音"而丢掉开头.
+                # 关键: Beep() 返回只代表声音提交完毕, 它还要经过音频引擎/输出链路的
+                # 缓冲(HDMI/蓝牙可达 0.1~0.3s, 设备刚从空闲唤醒时最久)才真正从扬声器
+                # 放出来; 必须等它放完再静音, 否则提示音会被 SetMute 整个吞掉 --
+                # 这就是"有时候开始录音没有提示音"的原因.
+                guard = 0.06 + _output_latency() + 0.05   # 60ms 响铃 + 输出链路延迟 + 余量
+                self._beep_cut = int(guard * sr)   # 开头这段(提示音+静音前背景声)识别前抹零
+                _beep(1100, 60)
+                if self.mute.enabled:
+                    time.sleep(guard - 0.06)       # Beep 已同步耗掉 60ms, 补等输出链路放完
+            self.mute.start()            # 提示音真正放完才静音: 音乐/视频声不进麦克风
         threading.Thread(target=self._watchdog, args=(self.sid,), daemon=True).start()
         if self.cfg.get("live_preview", False):
             threading.Thread(target=self._live_loop, args=(self.sid,), daemon=True).start()
-        # 开始提示音已提前到开麦前同步响(见 start_rec 前段); 结束提示音在 stop_rec 里
+        # 开始提示音在开麦后响、放完才静音(见 start_rec); 结束提示音在 stop_rec 里
         log("● 录音中 ...")
 
     def _live_loop(self, sid):
@@ -964,6 +979,8 @@ class VoiceInput:
                 if not chunks:
                     continue
                 audio = np.concatenate(chunks, axis=0).reshape(-1)
+                if self._beep_cut:    # 草稿同样抹掉开头提示音, 免得草稿里冒出怪字符
+                    audio[:min(self._beep_cut, audio.size)] = 0
                 if audio.size < sr:
                     continue
                 cut = audio.size > cap
@@ -1025,6 +1042,10 @@ class VoiceInput:
         # (N,1) 拼成 (N,1), 再展平成 (N,): 与原来“写 wav 再 sf.read 回来”的形状一致,
         # VAD/ASR 的特征提取都要求一维数组
         audio = np.concatenate(chunks, axis=0).reshape(-1)
+        if self._beep_cut:            # 抹掉开头的提示音+静音前漏进的背景声(防误识别),
+            cut = min(self._beep_cut, audio.shape[0])
+            audio[:cut] = 0           # 且要先抹再做自动增益, 否则提示音的满幅峰值会压低增益
+            self._beep_cut = 0
         # 自动增益: 麦克风音量偏小时把电平拉到合适范围(最多放大 20 倍)
         f = audio.astype(np.float32)
         peak = float(np.abs(f).max()) if f.size else 0.0
@@ -1221,12 +1242,26 @@ class VoiceInput:
             self.mute.stop()         # 无论怎么退出都把扬声器恢复回来
 
 
+_beep_lock = threading.Lock()     # 提示音串行播放: 两声重叠时部分驱动会让后一声直接失败
+
+
 def _beep(freq, ms):
     try:
         import winsound
-        winsound.Beep(freq, ms)
+        with _beep_lock:
+            winsound.Beep(freq, ms)
+    except Exception as e:
+        log(f"提示音播放失败({freq}Hz/{ms}ms): {e}")
+
+
+def _output_latency():
+    """默认输出设备的渲染延迟(秒). Beep 返回≠声音已放出, 静音前得等它真正响完"""
+    try:
+        info = sd.query_devices(kind="output")
+        lat = float(info["default_high_output_latency"])
+        return min(max(lat, 0.05), 0.35)
     except Exception:
-        pass
+        return 0.10
 
 
 def _single_instance():
