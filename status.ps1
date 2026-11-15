@@ -1,5 +1,5 @@
 $procs = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*voice_typing.py*' }
+    Where-Object { $_.CommandLine -like "*$PSScriptRoot*voice_typing.py*" }
 
 if ($procs) {
     # venv 的 pythonw.exe 是个引导器存根, 它会拉起基础解释器(py312)当子进程干活,

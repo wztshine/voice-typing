@@ -6,6 +6,7 @@
 import argparse
 import atexit
 import ctypes
+import json
 import logging
 import os
 import queue
@@ -34,6 +35,8 @@ MODELS = os.path.join(BASE, "models")
 TMP_WAV = os.path.join(BASE, "logs", "uttr")  # 实际文件名带时间戳, 避免并发覆盖
 LOG = os.path.join(BASE, "logs", "voice_typing.log")
 CONFIG = os.path.join(BASE, "config.json")
+MUTE_OWNER = os.path.join(BASE, "logs", "mute_owner.json")  # 扬声器静音所有权: 异常退出后自愈
+STOP_FLAG = os.path.join(BASE, "logs", "stop.flag")         # 优雅停止标志(stop.ps1 写入)
 
 CFG = dict(
     hotkey="ctrl_r",               # 按住说话 (改为 f9 / scroll_lock / right_ctrl ...)
@@ -75,7 +78,10 @@ CFG = dict(
 def log(msg):
     line = time.strftime("%H:%M:%S ") + str(msg)
     if sys.stdout is not None:
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except Exception:      # 控制台/管道失效时不能让 log 从任意线程炸出异常
+            pass
     try:
         if os.path.exists(LOG) and os.path.getsize(LOG) > 3 * 1024 * 1024:
             os.replace(LOG, LOG + ".1")
@@ -520,6 +526,22 @@ def _patch_aed_fast_load():
     return "fp16+mmap (%.1f GB)" % (os.path.getsize(p) / 1024 ** 3)
 
 
+def _default_endpoint():
+    """在当前线程初始化 COM 并拿默认播放设备的音量接口, 拿不到返回 None"""
+    if os.name != "nt":
+        return None
+    try:
+        import comtypes
+        try:                  # 工作线程可能还没初始化 COM; 已初始化时调用无害
+            comtypes.CoInitialize()
+        except OSError:
+            pass
+        from pycaw.pycaw import AudioUtilities
+        return AudioUtilities.GetSpeakers().EndpointVolume
+    except Exception:
+        return None
+
+
 class SpeakerMute:
     """录音期间静音默认扬声器, 结束后恢复 (config: mute_speaker)
 
@@ -535,21 +557,51 @@ class SpeakerMute:
         self.active = False       # 当前是否处于"由本程序静音"的状态
         self._was_muted = False   # 进入前的原状态
         self._warned = False      # pycaw 缺失只提醒一次
+        self._heal_orphan()       # 上个进程可能死在"静音中"(强杀/崩溃): 启动时自愈
+
+    def _write_owner(self):
+        """记下"扬声器静音是本程序干的": 进程被强杀时, 下次启动/--unmute 据此恢复"""
+        try:
+            os.makedirs(os.path.dirname(MUTE_OWNER), exist_ok=True)
+            with open(MUTE_OWNER, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "was_muted": self._was_muted,
+                           "t": time.time()}, f)
+        except Exception:
+            pass
+
+    def _clear_owner(self):
+        try:
+            if os.path.exists(MUTE_OWNER):
+                os.remove(MUTE_OWNER)
+        except Exception:
+            pass
+
+    def _heal_orphan(self):
+        """发现所有权文件 = 上个进程死在静音中, 没来得及恢复: 补恢复"""
+        try:
+            if not os.path.exists(MUTE_OWNER):
+                return
+            with open(MUTE_OWNER, "r", encoding="utf-8") as f:
+                info = json.load(f)
+        except Exception:
+            return
+        if info.get("was_muted"):
+            self._clear_owner()   # 上个实例进入前本来就静音, 无需恢复
+            return
+        ep = self._endpoint()
+        if ep is None:
+            log("上次异常退出遗留了扬声器静音, 但暂拿不到音频设备; 可手动取消静音, "
+                "或运行 voice_typing.py --unmute 重试")
+            return                # 文件留着, --unmute / 下次启动再试
+        try:
+            ep.SetMute(0, None)
+        except Exception:
+            return                # 恢复失败: 留着文件下次再试
+        self._clear_owner()
+        log("检测到上次异常退出时扬声器未恢复, 已自动取消静音")
 
     def _endpoint(self):
-        """在当前线程初始化 COM 并拿默认播放设备的音量接口, 拿不到返回 None"""
-        if os.name != "nt":
-            return None
-        try:
-            import comtypes
-            try:                  # 工作线程可能还没初始化 COM; 已初始化时调用无害
-                comtypes.CoInitialize()
-            except OSError:
-                pass
-            from pycaw.pycaw import AudioUtilities
-            return AudioUtilities.GetSpeakers().EndpointVolume
-        except Exception:
-            return None
+        return _default_endpoint()
 
     def start(self):
         """录音开始: 记住原状态并静音. 任何失败都只降级, 绝不抛异常"""
@@ -570,6 +622,7 @@ class SpeakerMute:
             if not self._was_muted:
                 vol.SetMute(1, None)
                 self.active = True
+                self._write_owner()
                 log("录音期间已静音扬声器(防幻听), 结束后恢复")
             # 进入前本来就是静音的就不动它, 结束时也无需恢复
         except Exception:
@@ -589,6 +642,7 @@ class SpeakerMute:
                 return            # 保留 active=True, 下次 start 时补恢复
             vol.SetMute(0, None)
             self.active = False   # 恢复成功才清除标记, 失败则下次开麦重试
+            self._clear_owner()
             log("扬声器已恢复")
         except Exception:
             log("扬声器恢复失败, 下次开麦时自动补恢复:\n" + traceback.format_exc())
@@ -805,6 +859,7 @@ class VoiceInput:
         self.chunks = []
         self.rec_lock = threading.Lock()   # 录音开始/结束互斥: 防止看门狗和热键同时停/开
         self._beep_cut = 0            # 开录音头几帧要抹零的采样数(提示音+静音前漏进的背景声)
+        self._cmd_q = queue.Queue()   # 热键命令队列: 开麦/响铃/静音不占 pynput 监听线程
         self.q = queue.Queue()
         self.kb = keyboard.Controller()
         self.system = None
@@ -938,7 +993,7 @@ class VoiceInput:
                 raise
             self.stream = stream
             self.recording = True
-            self.t_rec = time.time()     # 从开麦那刻计时: 等提示音的时间不吃录音时长
+            self.t_rec = time.monotonic()  # 从开麦那刻计时: 等提示音的时间不吃录音时长
             self.sid = self.t_rec
             if self.ui is not None:
                 self.ui.set_state("rec")
@@ -974,7 +1029,7 @@ class VoiceInput:
             time.sleep(max(interval, cost * 1.3))
             if not self.recording or getattr(self, "sid", None) != sid:
                 return
-            if time.time() - self.t_rec < after:
+            if time.monotonic() - self.t_rec < after:
                 continue
             if not self.model_lock.acquire(False):
                 continue
@@ -1010,7 +1065,7 @@ class VoiceInput:
 
     def _watchdog(self, sid):
         while self.recording and getattr(self, "sid", None) == sid:
-            if time.time() - self.t_rec > self.cfg["max_sec"]:
+            if time.monotonic() - self.t_rec > self.cfg["max_sec"]:
                 log(f"录音超过 {self.cfg['max_sec']}s, 自动停止")
                 self.stop_rec()
                 return
@@ -1021,18 +1076,18 @@ class VoiceInput:
             if not self.recording:
                 return
             self.recording = False       # 先置标志: watchdog 和热键释放可能同时调进来
-            dur = time.time() - self.t_rec
+            dur = time.monotonic() - self.t_rec
             stream, self.stream = self.stream, None
-            chunks = self.chunks          # 用局部副本处理, 新录音随时可以把 self.chunks 清零
-            self.chunks = []
             if stream is not None:
                 try:
-                    stream.stop()
+                    stream.stop()         # 先停流再快照: 回调不再追加, 不丢最后一块(句尾)
                 finally:
                     try:
                         stream.close()    # stop 报错也不能跳过 close, 否则设备被占用
                     except Exception:
                         pass
+            chunks = self.chunks          # rec_lock 已握住, 此刻不可能有新录音清零 chunks
+            self.chunks = []
             self.mute.stop()              # 恢复扬声器(后面"说话太短"等提前 return 前也要恢复)
         if self.cfg["beep"]:
             threading.Thread(target=_beep, args=(780, 60), daemon=True).start()
@@ -1135,7 +1190,7 @@ class VoiceInput:
                         # 完整快照失败(剪贴板被长期占用), 退化到只存纯文本: 文本至少还能还回去
                         try:
                             t = pyperclip.paste()
-                            snap = [(13, (t + "\x00").encode("utf-16-le"), False)] if t else []
+                            snap = [(13, (t + "\x00").encode("utf-16-le"), False)] if t else None
                         except Exception:
                             snap = None
                     self._clip_original = snap
@@ -1157,23 +1212,25 @@ class VoiceInput:
                         self._clip_pending = False
                         data = self._clip_original
                         self._clip_original = None
-                    if data is None:
-                        return          # 快照失败, 宁可不动剪贴板也别把它弄丢
-                    try:
-                        if clipboard_sequence() != seq:
-                            return      # 粘贴后用户又复制了新内容, 还原会把它覆盖掉
-                        if not clipboard_restore(data):
-                            # 剪贴板被长期锁死(极少见), 至少把原文本写回
-                            try:
-                                for f, d, gdi in data:
-                                    if f == 13 and not gdi:
-                                        pyperclip.copy(
-                                            d.decode("utf-16-le", "ignore").rstrip("\x00"))
-                                        break
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                        if data is None:
+                            return      # 快照失败, 宁可不动剪贴板也别把它弄丢
+                        # 校验+还原都要在锁内完成: 否则下一次识别的快照会落进
+                        # "已清 pending、未完成还原"的窗口, 把识别文本误当用户原剪贴板
+                        try:
+                            if clipboard_sequence() != seq:
+                                return      # 粘贴后用户又复制了新内容, 还原会把它覆盖掉
+                            if not clipboard_restore(data):
+                                # 剪贴板被长期锁死(极少见), 至少把原文本写回
+                                try:
+                                    for f, d, gdi in data:
+                                        if f == 13 and not gdi:
+                                            pyperclip.copy(
+                                                d.decode("utf-16-le", "ignore").rstrip("\x00"))
+                                            break
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                 threading.Thread(target=restore, daemon=True).start()
         else:
             _type_text(text)
@@ -1183,28 +1240,66 @@ class VoiceInput:
         if key in self.down:      # 忽略系统按键重复
             return
         self.down.add(key)
+        # 只投递命令立即返回: start_rec 里的响铃+等待+COM 调用若在 pynput 监听线程
+        # 里同步执行, 会阻塞低级键盘钩子, 超时后钩子甚至被 Windows 静默摘除(热键失灵)
         try:
             if self.toggle_key is not None and key == self.toggle_key:
-                if self.recording:
-                    self.stop_rec()
-                else:
-                    self.start_rec()
+                self._cmd_q.put("toggle")
             elif self.hotkey is not None and key == self.hotkey and not self.recording:
-                self.start_rec()
-        except Exception as e:
-            if isinstance(e, sd.PortAudioError):
-                log(f"麦克风打不开({e}); 请检查 config.json 的 device, "
-                    f"或用 --list-devices 查看可用设备")
-            else:
-                log("启动录音出错:\n" + traceback.format_exc())
+                self._cmd_q.put("start")
+        except Exception:
+            log("投递热键命令失败:\n" + traceback.format_exc())
 
     def on_release(self, key):
         self.down.discard(key)
         if self.hotkey is not None and key == self.hotkey:
             try:
-                self.stop_rec()
+                self._cmd_q.put("stop")
             except Exception:
-                log("停止录音出错:\n" + traceback.format_exc())
+                log("投递热键命令失败:\n" + traceback.format_exc())
+
+    def _control_loop(self):
+        """单线程串行执行录音开关命令: 耗时操作不占监听线程;
+        start/stop 同线程顺序执行, mute 的 start/stop 配对不会交错"""
+        while True:
+            cmd = self._cmd_q.get()
+            try:
+                if cmd == "start":
+                    self.start_rec()
+                elif cmd == "stop":
+                    self.stop_rec()
+                elif cmd == "toggle":
+                    if self.recording:
+                        self.stop_rec()
+                    else:
+                        self.start_rec()
+            except sd.PortAudioError as e:
+                log(f"麦克风打不开({e}); 请检查 config.json 的 device, "
+                    f"或用 --list-devices 查看可用设备")
+            except Exception:
+                log("录音开关出错:\n" + traceback.format_exc())
+
+    def _stop_flag_loop(self):
+        """stop.ps1 写入 STOP_FLAG 触发优雅退出: 先恢复扬声器再退出,
+        避免强杀进程把扬声器永远留在静音态"""
+        while True:
+            try:
+                if os.path.exists(STOP_FLAG):
+                    try:
+                        os.remove(STOP_FLAG)
+                    except Exception:
+                        pass
+                    log("收到停止标志, 恢复扬声器后退出...")
+                    try:
+                        if self.recording:
+                            self.stop_rec()
+                        self.mute.stop()
+                    except Exception:
+                        log("退出前恢复扬声器失败:\n" + traceback.format_exc())
+                    os._exit(0)      # 状态已恢复, 立即退出(不等 Tk/线程)
+            except Exception:
+                pass
+            time.sleep(0.15)
 
     def run(self):
         if self.cfg.get("postprocess", True):
@@ -1212,6 +1307,16 @@ class VoiceInput:
                 ("可用" if postprocess.lazy_pinyin else "未安装(中文域名不转拼音, 其它功能不受影响)"))
         self.load_model()
         threading.Thread(target=self.worker, daemon=True).start()
+
+        # 优雅停止通道: stop.ps1 写标志 -> 这里恢复扬声器再退出(强杀来不及恢复);
+        # 先清掉上次没消费完的残留标志, 防止新实例一启动就退出
+        try:
+            if os.path.exists(STOP_FLAG):
+                os.remove(STOP_FLAG)
+        except Exception:
+            pass
+        threading.Thread(target=self._control_loop, daemon=True).start()
+        threading.Thread(target=self._stop_flag_loop, daemon=True).start()
 
         root = None
         if self.cfg.get("show_ui", True):
@@ -1263,9 +1368,30 @@ def _output_latency():
     try:
         info = sd.query_devices(kind="output")
         lat = float(info["default_high_output_latency"])
-        return min(max(lat, 0.05), 0.35)
+        return min(max(lat, 0.05), 0.60)   # 上限放宽: 电视/部分蓝牙链路延迟可达 0.5s+
     except Exception:
         return 0.10
+
+
+def _unmute_orphan():
+    """--unmute: 若扬声器静音是本程序遗留的(所有权文件还在), 取消之"""
+    try:
+        if not os.path.exists(MUTE_OWNER):
+            return 0
+        with open(MUTE_OWNER, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        os.remove(MUTE_OWNER)
+    except Exception:
+        return 0
+    if info.get("was_muted"):
+        return 0                     # 上个实例进入前本来就是静音的, 不替用户解开
+    ep = _default_endpoint()
+    if ep is not None:
+        try:
+            ep.SetMute(0, None)
+        except Exception:
+            pass
+    return 0
 
 
 def _single_instance():
@@ -1373,11 +1499,16 @@ def main():
     ap.add_argument("--file", help="转写指定音频文件后退出(不常驻)")
     ap.add_argument("--dry-run", action="store_true", help="只识别不输入(测试用)")
     ap.add_argument("--no-post", action="store_true", help="关闭输出后处理(保留原始识别文本)")
+    ap.add_argument("--unmute", action="store_true",
+                    help="若扬声器静音是本程序异常退出遗留的, 取消之(stop.ps1 强杀兜底用)")
     a = ap.parse_args()
 
     if a.list_devices:
         print(sd.query_devices())
         return
+
+    if a.unmute:
+        return _unmute_orphan()
 
     # 先读 config.json, 再应用命令行参数, 否则参数会被配置文件里的值覆盖
     load_config()
