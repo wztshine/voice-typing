@@ -526,6 +526,19 @@ def _patch_aed_fast_load():
     return "fp16+mmap (%.1f GB)" % (os.path.getsize(p) / 1024 ** 3)
 
 
+def _pid_alive(pid):
+    """Windows 下判断进程是否还活着(所有权文件防误伤并发实例用)"""
+    try:
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+        # 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION
+    except Exception:
+        return False
+    if not h:
+        return False
+    ctypes.windll.kernel32.CloseHandle(h)
+    return True
+
+
 def _default_endpoint():
     """在当前线程初始化 COM 并拿默认播放设备的音量接口, 拿不到返回 None"""
     if os.name != "nt":
@@ -563,9 +576,11 @@ class SpeakerMute:
         """记下"扬声器静音是本程序干的": 进程被强杀时, 下次启动/--unmute 据此恢复"""
         try:
             os.makedirs(os.path.dirname(MUTE_OWNER), exist_ok=True)
-            with open(MUTE_OWNER, "w", encoding="utf-8") as f:
+            tmp = MUTE_OWNER + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"pid": os.getpid(), "was_muted": self._was_muted,
                            "t": time.time()}, f)
+            os.replace(tmp, MUTE_OWNER)   # 原子落盘: 防止写一半被强杀留下坏文件
         except Exception:
             pass
 
@@ -581,13 +596,19 @@ class SpeakerMute:
         try:
             if not os.path.exists(MUTE_OWNER):
                 return
-            with open(MUTE_OWNER, "r", encoding="utf-8") as f:
-                info = json.load(f)
+            try:
+                with open(MUTE_OWNER, "r", encoding="utf-8") as f:
+                    info = json.load(f)
+            except Exception:
+                info = {}     # 文件损坏: 只有本程序会写它, 按孤儿静音处理
+                log("静音所有权文件损坏, 按上次异常退出遗留处理")
         except Exception:
             return
         if info.get("was_muted"):
             self._clear_owner()   # 上个实例进入前本来就静音, 无需恢复
             return
+        if info.get("pid") and _pid_alive(info["pid"]):
+            return                # 活实例的所有权文件(如并发 --dry-run), 不是孤儿, 不动
         ep = self._endpoint()
         if ep is None:
             log("上次异常退出遗留了扬声器静音, 但暂拿不到音频设备; 可手动取消静音, "
@@ -1081,6 +1102,10 @@ class VoiceInput:
             if stream is not None:
                 try:
                     stream.stop()         # 先停流再快照: 回调不再追加, 不丢最后一块(句尾)
+                except Exception:
+                    # 不能让 stop 的异常传播出去: 否则跳过下面的 mute.stop(扬声器
+                    # 停在静音态), 且从看门狗线程调用时会直接杀死看门狗线程
+                    log("停止音频流失败(设备可能被拔出):\n" + traceback.format_exc())
                 finally:
                     try:
                         stream.close()    # stop 报错也不能跳过 close, 否则设备被占用
@@ -1245,7 +1270,10 @@ class VoiceInput:
         try:
             if self.toggle_key is not None and key == self.toggle_key:
                 self._cmd_q.put("toggle")
-            elif self.hotkey is not None and key == self.hotkey and not self.recording:
+            elif self.hotkey is not None and key == self.hotkey:
+                # 不看 recording: control_loop 可能还在执行上一次 start(其间
+                # recording 仍为 True), 快速"按-松-再按"会把第二句静默丢掉;
+                # start_rec 自身幂等, 录音中投进来也只是空转一圈
                 self._cmd_q.put("start")
         except Exception:
             log("投递热键命令失败:\n" + traceback.format_exc())
@@ -1296,7 +1324,10 @@ class VoiceInput:
                         self.mute.stop()
                     except Exception:
                         log("退出前恢复扬声器失败:\n" + traceback.format_exc())
-                    os._exit(0)      # 状态已恢复, 立即退出(不等 Tk/线程)
+                    t0 = time.monotonic()
+                    while self._clip_pending and time.monotonic() - t0 < 0.8:
+                        time.sleep(0.05)   # 等一眼还没跑完的剪贴板还原(它睡 0.5s 才动手),
+                    os._exit(0)            # 别把用户原剪贴板永久留在识别文本上
             except Exception:
                 pass
             time.sleep(0.15)
@@ -1305,18 +1336,17 @@ class VoiceInput:
         if self.cfg.get("postprocess", True):
             log("后处理: 开, 拼音模块(pypinyin): " +
                 ("可用" if postprocess.lazy_pinyin else "未安装(中文域名不转拼音, 其它功能不受影响)"))
-        self.load_model()
-        threading.Thread(target=self.worker, daemon=True).start()
-
-        # 优雅停止通道: stop.ps1 写标志 -> 这里恢复扬声器再退出(强杀来不及恢复);
+        # 优雅停止通道要先于模型加载(加载可长达 1 分钟, 期间也要能响应停止),
         # 先清掉上次没消费完的残留标志, 防止新实例一启动就退出
         try:
             if os.path.exists(STOP_FLAG):
                 os.remove(STOP_FLAG)
         except Exception:
             pass
-        threading.Thread(target=self._control_loop, daemon=True).start()
         threading.Thread(target=self._stop_flag_loop, daemon=True).start()
+        self.load_model()
+        threading.Thread(target=self.worker, daemon=True).start()
+        threading.Thread(target=self._control_loop, daemon=True).start()
 
         root = None
         if self.cfg.get("show_ui", True):
@@ -1346,7 +1376,8 @@ class VoiceInput:
             if root is not None:
                 root.mainloop()      # Tk 必须占主线程, 键盘监听在后台线程
             else:
-                listener.join()
+                listener.join()  # 正常不会返回; 返回说明钩子被摘/监听停止
+                log("键盘监听已停止, 程序退出")
         finally:
             self.mute.stop()         # 无论怎么退出都把扬声器恢复回来
 
@@ -1378,17 +1409,30 @@ def _unmute_orphan():
     try:
         if not os.path.exists(MUTE_OWNER):
             return 0
-        with open(MUTE_OWNER, "r", encoding="utf-8") as f:
-            info = json.load(f)
-        os.remove(MUTE_OWNER)
+        try:
+            with open(MUTE_OWNER, "r", encoding="utf-8") as f:
+                info = json.load(f)
+        except Exception:
+            info = {}    # 文件损坏: 只有本程序会写它, 按遗留静音处理
+            log("静音所有权文件损坏, 按上次异常退出遗留处理")
     except Exception:
         return 0
+    if info.get("pid") and _pid_alive(info["pid"]):
+        return 0         # 活实例(并发 --dry-run 等), 不是孤儿, 不动
     if info.get("was_muted"):
-        return 0                     # 上个实例进入前本来就是静音的, 不替用户解开
+        try:
+            os.remove(MUTE_OWNER)
+        except Exception:
+            pass
+        return 0         # 上个实例进入前本来就是静音的, 不替用户解开
     ep = _default_endpoint()
     if ep is not None:
         try:
-            ep.SetMute(0, None)
+            ep.SetMute(0, None)   # 恢复成功才删所有权文件, 失败留给下次再试
+            try:
+                os.remove(MUTE_OWNER)
+            except Exception:
+                pass
         except Exception:
             pass
     return 0
