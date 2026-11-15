@@ -918,7 +918,7 @@ class VoiceInput:
         self.q = queue.Queue()
         self.kb = keyboard.Controller()
         self.system = None
-        self.down = set()
+        self.down = {}             # key -> 最近事件时刻(monotonic); 值过期 = release 丢了
         self.ui = None
         self.mute = SpeakerMute(cfg.get("mute_speaker"))
         atexit.register(self.mute.stop)    # 退出(含 Ctrl+C)时兜底恢复扬声器
@@ -1064,14 +1064,26 @@ class VoiceInput:
                 guard = 0.06 + _output_latency() + 0.05   # 60ms 响铃 + 输出链路延迟 + 余量
                 self._beep_cut = int(guard * sr)   # 开头这段(提示音+静音前背景声)识别前抹零
                 _beep(1100, 60)
-                if self.mute.enabled:
-                    time.sleep(guard - 0.06)       # Beep 已同步耗掉 60ms, 补等输出链路放完
-                self.mute.start()        # 提示音真正放完才静音: 音乐/视频声不进麦克风
+                # 等提示音放完再静音的这段等待(约 0.2~0.3s)挪到后台: 卡在控制循环里的
+                # 话, 高频连按时每圈串行耗时 0.4s+, 命令越积越多, 按键就像失灵了
+                threading.Thread(target=self._mute_after_beep,
+                                 args=(self.sid, guard), daemon=True).start()
         threading.Thread(target=self._watchdog, args=(self.sid,), daemon=True).start()
         if self.cfg.get("live_preview", False):
             threading.Thread(target=self._live_loop, args=(self.sid,), daemon=True).start()
         # 开始提示音在开麦后响、放完才静音(见 start_rec); 结束提示音在 stop_rec 里
         log("● 录音中 ...")
+
+    def _mute_after_beep(self, sid, guard):
+        """等开始提示音真正放完(HDMI/蓝牙链路有缓冲)再静音扬声器. 在后台线程等:
+        不阻塞控制循环, 高频连按不积压.
+        静音前在 rec_lock 里核对 sid: 等待期间用户可能已松键(stop_rec 已恢复过
+        扬声器), 过期的静音绝不能落地, 否则扬声器被永远留在静音态."""
+        if self.mute.enabled:
+            time.sleep(guard - 0.06)     # Beep 已同步耗掉 60ms, 补等输出链路放完
+        with self.rec_lock:
+            if self.recording and self.sid == sid:
+                self.mute.start()        # 提示音真正放完才静音: 音乐/视频声不进麦克风
 
     def _live_loop(self, sid):
         """长句边说边出草稿: 定时把已录到的音频重新识别一遍, 只显示, 不输入"""
@@ -1311,9 +1323,17 @@ class VoiceInput:
 
     # ---------- hotkey ----------
     def on_press(self, key):
-        if key in self.down:      # 忽略系统按键重复
+        now = time.monotonic()
+        last = self.down.get(key)
+        if last is not None and now - last < 0.5:
+            self.down[key] = now         # 正常按住: 系统自动重复(约33ms一发), 只刷新时间
             return
-        self.down.add(key)
+        if last is not None:
+            # 上次按下后 0.5s 内没有任何重复事件, 只能是 release 丢了(睡眠唤醒/驱动
+            # 吞事件, 实际发生过): 不复位的话这个键会被当成"一直按着", 之后的每次
+            # 按下全被当自动重复忽略 -- 热键就此失灵到看门狗超时为止
+            log("检测到按键 release 事件丢失, 自动复位")
+        self.down[key] = now
         # 只投递命令立即返回: start_rec 里的响铃+等待+COM 调用若在 pynput 监听线程
         # 里同步执行, 会阻塞低级键盘钩子, 超时后钩子甚至被 Windows 静默摘除(热键失灵)
         try:
@@ -1328,7 +1348,7 @@ class VoiceInput:
             log("投递热键命令失败:\n" + traceback.format_exc())
 
     def on_release(self, key):
-        self.down.discard(key)
+        self.down.pop(key, None)
         if self.hotkey is not None and key == self.hotkey:
             try:
                 self._cmd_q.put("stop")
