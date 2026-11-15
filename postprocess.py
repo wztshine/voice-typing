@@ -54,20 +54,37 @@ def cn2int(s):
     return total + section + num
 
 
+def _cn2num(s):
+    """cn2int + 防御: "万万" 这类被解析成 0 的怪串视为失败(与 _cn2str 同规则)。
+    真零不受影响: "零元" 原文含 零, 照常转 "0元" """
+    v = cn2int(s)
+    if v == 0 and not any(c in "零〇" for c in s):
+        return None
+    return v
+
+
 def _sub_num(m):
-    v = cn2int(m.group("num"))
+    v = _cn2num(m.group("num"))
     return (str(v) + m.group("unit")) if v is not None else m.group(0)
+
+
+def _sub_date(m):
+    """月/日/号: 无系数的裸单位字(百/千/万)多半是词的一部分(百日咳/千日红), 不是日期, 不转;
+    "十号/十日/三月十五日" 这类正常日期照转"""
+    if m.group("num") in ("百", "千", "万"):
+        return m.group(0)
+    return _sub_num(m)
 
 
 def _sub_percent(m):
     body = m.group(1)
     if "点" in body:
         a, _, b = body.partition("点")
-        x, y = cn2int(a), cn2int(b)
+        x, y = _cn2num(a), _cn2num(b)
         if x is None or y is None:
             return m.group(0)
         return f"{x}.{y}%"
-    v = cn2int(body)
+    v = _cn2num(body)
     return m.group(0) if v is None else f"{v}%"
 
 
@@ -434,7 +451,7 @@ def apply(text, cfg=None, rules=None):
         try:
             out = RE_PERCENT.sub(_sub_percent, out)
             out = RE_YEAR.sub(_sub_year, out)
-            out = RE_MONTH.sub(_sub_num, out)
+            out = RE_MONTH.sub(_sub_date, out)
             out = RE_MONEY.sub(_sub_num, out)
             out = RE_PERIOD_TIME.sub(_sub_period_time, out)
             out = RE_TIME.sub(_sub_time, out)

@@ -136,6 +136,7 @@ def load_config():
         if tp in ("auto", "strip", "keep"):
             CFG["trailing_punct"] = tp
         else:
+            CFG["trailing_punct"] = "auto"   # 日志声称回退就得真回退, 否则坏值会让末尾标点永远保留
             log(f"config trailing_punct={data['trailing_punct']!r} 应为 auto/strip/keep, 已回退 auto")
     for k in ("uppercase_abbr", "latin_keep_case"):
         if k in data:
@@ -240,6 +241,7 @@ def clipboard_snapshot():
     快照失败返回 None (此时不能还原, 否则会把剪贴板弄丢)。
     图片(CF_BITMAP/DIB/PNG)、文件(CF_HDROP)、HTML/RTF 等富格式都能完整保留。"""
     items = []
+    g = None
     try:
         u, g, k = _clip_api()
         if not _clip_open(u):
@@ -296,6 +298,8 @@ def clipboard_snapshot():
             u.CloseClipboard()
     except Exception:
         log("剪贴板快照失败:\n" + traceback.format_exc())
+        # 半途而废的快照: CopyImage/CopyEnhMetaFile 复制出来的 GDI 句柄没人接管, 自己释放防泄漏
+        _clip_free_gdi(g, items)
         return None
 
 
@@ -1296,6 +1300,9 @@ class VoiceInput:
                         # "已清 pending、未完成还原"的窗口, 把识别文本误当用户原剪贴板
                         try:
                             if clipboard_sequence() != seq:
+                                # 快照弃用: 复制出来的 GDI 句柄没交给剪贴板, 自己释放防泄漏
+                                # (不能在下面的 except 里释放: 那时可能已有一部分交给了系统, 误删会弄坏剪贴板)
+                                _clip_free_gdi(_clip_api()[1], data)
                                 return      # 粘贴后用户又复制了新内容, 还原会把它覆盖掉
                             if not clipboard_restore(data):
                                 # 剪贴板被长期锁死(极少见), 至少把原文本写回
