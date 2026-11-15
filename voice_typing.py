@@ -959,6 +959,12 @@ class VoiceInput:
             if isinstance(key, str):
                 log(f"警告: {label} {raw!r} 不是有效的按键名, 这个键不会生效; "
                     f"请双击「设置热键.bat」重新选择")
+        if (self.hotkey is not None and self.toggle_key is not None
+                and self.hotkey == self.toggle_key):
+            # 两个键相同: 按下走 toggle 分支(开始), 松开却走 hotkey 分支(立刻停止),
+            # 切换模式静默退化成"长按说话" -- 必须提醒而不是让用户猜
+            log(f"警告: hotkey 和 toggle_key 都是 {cfg.get('hotkey')!r}, "
+                f"切换键将失效(按下即被松开停止); 请在 config.json 里改成不同的键")
 
     # ---------- model ----------
     def load_model(self):
