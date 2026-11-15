@@ -662,7 +662,11 @@ class SpeakerMute:
             return
         try:
             self._was_muted = bool(vol.GetMute())
-            if not self._was_muted:
+            if self._was_muted:
+                # 开录前扬声器就是静音的(用户自设或恢复失败遗留): 不动它, 但提示音
+                # 会听不见, 留一行日志方便排查"怎么又没提示音"
+                log("开录前扬声器已是静音(非本程序所为), 本次提示音会听不见")
+            else:
                 vol.SetMute(1, None)
                 self.active = True
                 self._write_owner()
@@ -678,17 +682,25 @@ class SpeakerMute:
         if self._was_muted:
             self.active = False
             return                # 进入前本来就是静音的, 不替用户取消静音
-        try:
-            vol = self._endpoint()
-            if vol is None:
-                log("扬声器恢复失败(拿不到音频设备), 下次开麦时自动补恢复")
-                return            # 保留 active=True, 下次 start 时补恢复
-            vol.SetMute(0, None)
-            self.active = False   # 恢复成功才清除标记, 失败则下次开麦重试
-            self._clear_owner()
-            log("扬声器已恢复")
-        except Exception:
-            log("扬声器恢复失败, 下次开麦时自动补恢复:\n" + traceback.format_exc())
+        # 刚从睡眠唤醒时可能拿到已断连设备的旧接口: SetMute"成功"返回却没真正
+        # 生效, 扬声器被留在静音态, 之后开录的提示音全被吞(2026-11-15 实际发生过).
+        # 所以写完必须用新接口读回验证, 没生效就换接口重试(音频服务唤醒要几秒才就绪)
+        for attempt in range(4):
+            try:
+                vol = self._endpoint()
+                if vol is not None:
+                    vol.SetMute(0, None)
+                    chk = self._endpoint()   # 换个新对象验证, 别信可能已断连的旧接口
+                    if chk is not None and not bool(chk.GetMute()):
+                        self.active = False  # 验证生效才清除标记, 失败则下次开麦重试
+                        self._clear_owner()
+                        log("扬声器已恢复" + ("(重试后生效)" if attempt else ""))
+                        return
+            except Exception:
+                pass              # 接口失效/服务未就绪: 重试
+            time.sleep(0.5)
+        log("扬声器恢复未生效(可能刚从睡眠唤醒, 设备未就绪), 下次开麦时自动补恢复")
+        # active 保持 True + 所有权文件保留: 下次 start 先补恢复, 重启后 --unmute 自愈
 
 
 class Overlay:
